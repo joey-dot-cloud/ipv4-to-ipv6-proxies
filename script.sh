@@ -16,6 +16,9 @@ usage() {
 Usage: 3proxy-random-ipv6-addresses.sh [options] [count] [user] [pass] [start_port] [iface]
 
 Options:
+  --install              Install 3proxy only and exit
+  --uninstall            Uninstall 3proxy and exit
+  --remove-ipv6 [IFACE]  Remove all global IPv6 /128 addresses from interface (default: auto-detect)
   -c, --count N         Number of IPv6 addresses to generate (overrides positional)
   -U, --user NAME       3proxy username
   -P, --pass PASS       3proxy password
@@ -49,10 +52,25 @@ CONFIG_FILE="/etc/3proxy.cfg"
 ADDRS_FILE="/etc/3proxy.ipv6"
 PROXY_LOG_FILE="/var/log/3proxy.log"
 PROXY_TYPE_INPUT=""
+INSTALL_ONLY=0
+UNINSTALL_ONLY=0
+REMOVE_IPV6_ONLY=0
+REMOVE_IPV6_IFACE=""
 
 # Parse options
 while [ $# -gt 0 ]; do
 	case "$1" in
+		--install) INSTALL_ONLY=1; shift;;
+		--uninstall) UNINSTALL_ONLY=1; shift;;
+		--remove-ipv6) 
+			REMOVE_IPV6_ONLY=1
+			if [ $# -gt 1 ] && [[ "$2" != -* ]]; then
+				REMOVE_IPV6_IFACE="$2"
+				shift 2
+			else
+				shift
+			fi
+			;;
 		-c|--count) COUNT_INPUT="$2"; shift 2;;
 		-U|--user) USER_INPUT="$2"; shift 2;;
 		-P|--pass) PASS_INPUT="$2"; shift 2;;
@@ -95,6 +113,159 @@ if ! command -v ip >/dev/null 2>&1; then
 	export DEBIAN_FRONTEND=noninteractive
 	apt-get update -y
 	apt-get install -y iproute2
+fi
+
+# -------- Install 3proxy function --------
+install_3proxy() {
+	if command -v 3proxy >/dev/null 2>&1; then
+		log "3proxy already installed at $(command -v 3proxy)."
+		return 0
+	fi
+	
+	log "Installing 3proxy..."
+	export DEBIAN_FRONTEND=noninteractive
+	apt-get update -y
+	apt-get install -y gcc make git
+	WORKDIR="$(mktemp -d)"
+	trap 'rm -rf "${WORKDIR}"; error "Cleanup after failure"' ERR
+	git clone --depth 1 https://github.com/3proxy/3proxy.git "${WORKDIR}/3proxy"
+	make -C "${WORKDIR}/3proxy" -f Makefile.Linux
+	install -m 0755 "${WORKDIR}/3proxy/bin/3proxy" /usr/local/bin/3proxy
+	rm -rf "${WORKDIR}"
+	trap - ERR
+	# restore global trap removed above
+	trap 'error "An unexpected error occurred at line $LINENO."' ERR
+	
+	log "3proxy installed successfully at /usr/local/bin/3proxy"
+	return 0
+}
+
+# -------- Uninstall 3proxy function --------
+uninstall_3proxy() {
+	log "Uninstalling 3proxy..."
+	
+	# Stop and disable systemd service if it exists
+	if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+		if systemctl is-active --quiet 3proxy 2>/dev/null; then
+			log "Stopping 3proxy service..."
+			systemctl stop 3proxy
+		fi
+		if systemctl is-enabled --quiet 3proxy 2>/dev/null; then
+			log "Disabling 3proxy service..."
+			systemctl disable 3proxy
+		fi
+		if [ -f /etc/systemd/system/3proxy.service ]; then
+			log "Removing systemd service file..."
+			rm -f /etc/systemd/system/3proxy.service
+			systemctl daemon-reload
+		fi
+	fi
+	
+	# Kill any running 3proxy processes
+	if pgrep -x 3proxy >/dev/null 2>&1; then
+		log "Killing running 3proxy processes..."
+		pkill -x 3proxy
+		sleep 2
+		if pgrep -x 3proxy >/dev/null 2>&1; then
+			warn "Some 3proxy processes may still be running"
+		fi
+	fi
+	
+	# Remove 3proxy binary
+	PROXY_BIN="$(command -v 3proxy || true)"
+	if [ -n "${PROXY_BIN}" ]; then
+		log "Removing 3proxy binary: ${PROXY_BIN}"
+		rm -f "${PROXY_BIN}"
+	fi
+	
+	# Remove default config files if they exist
+	if [ -f "/etc/3proxy.cfg" ]; then
+		log "Removing config file: /etc/3proxy.cfg"
+		rm -f "/etc/3proxy.cfg"
+	fi
+	
+	if [ -f "/etc/3proxy.ipv6" ]; then
+		log "Removing address file: /etc/3proxy.ipv6"
+		rm -f "/etc/3proxy.ipv6"
+	fi
+	
+	if [ -f "/var/log/3proxy.log" ]; then
+		log "Removing log file: /var/log/3proxy.log"
+		rm -f "/var/log/3proxy.log"
+	fi
+	
+	log "3proxy uninstalled successfully"
+	return 0
+}
+
+# -------- Remove IPv6 addresses function --------
+remove_ipv6_addresses() {
+	local target_iface="$1"
+	
+	# Auto-detect interface if not specified
+	if [ -z "${target_iface}" ]; then
+		target_iface="$(ip -6 route show default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev"){print $(i+1); exit}}' || true)"
+	fi
+	if [ -z "${target_iface}" ]; then
+		target_iface="$(ip -6 addr show scope global | awk '
+			/^[0-9]+: [^:]+:/ {iface=$2; sub(/:$/, "", iface); next}
+			/inet6/ && /scope global/ {print iface; exit}
+		' || true)"
+	fi
+	
+	if [ -z "${target_iface}" ]; then
+		echo "Failed to detect an interface with a global IPv6 address." >&2
+		exit 1
+	fi
+	
+	log "Removing global IPv6 /128 addresses from interface: ${target_iface}"
+	
+	# Find and remove all global /128 IPv6 addresses on the interface
+	mapfile -t TO_REMOVE < <(
+		ip -6 addr show dev "${target_iface}" scope global | awk '
+			/inet6/ {
+				split($2, a, "/")
+				if (a[2]=="128") print $2
+			}
+		'
+	)
+	
+	if [ "${#TO_REMOVE[@]}" -eq 0 ]; then
+		log "No global IPv6 /128 addresses found to remove on ${target_iface}."
+		return 0
+	fi
+	
+	log "Found ${#TO_REMOVE[@]} global IPv6 /128 addresses to remove on ${target_iface}..."
+	
+	local removed_count=0
+	for CIDR in "${TO_REMOVE[@]}"; do
+		debug "Removing ${CIDR} from ${target_iface}..."
+		if ip -6 addr del "${CIDR}" dev "${target_iface}"; then
+			removed_count=$((removed_count + 1))
+			debug "Successfully removed ${CIDR}"
+		else
+			warn "Failed to remove ${CIDR} from ${target_iface}"
+		fi
+	done
+	
+	log "Removed ${removed_count} out of ${#TO_REMOVE[@]} global IPv6 /128 addresses from ${target_iface}"
+	return 0
+}
+
+# -------- Handle install/uninstall/remove-ipv6 modes --------
+if [ "${INSTALL_ONLY}" -eq 1 ]; then
+	install_3proxy
+	exit 0
+fi
+
+if [ "${UNINSTALL_ONLY}" -eq 1 ]; then
+	uninstall_3proxy
+	exit 0
+fi
+
+if [ "${REMOVE_IPV6_ONLY}" -eq 1 ]; then
+	remove_ipv6_addresses "${REMOVE_IPV6_IFACE}"
+	exit 0
 fi
 
 prompt_nonempty() {
@@ -190,23 +361,7 @@ PROXY_USERNAME="$(printf '%s' "${USER_INPUT}" | tr -d '\r\n')"
 PROXY_PASSWORD="$(printf '%s' "${PASS_INPUT}" | tr -d '\r\n')"
 
 # -------- 3proxy install if missing --------
-if command -v 3proxy >/dev/null 2>&1; then
-	log "3proxy already installed at $(command -v 3proxy)."
-else
-	log "Installing 3proxy..."
-	export DEBIAN_FRONTEND=noninteractive
-	apt-get update -y
-	apt-get install -y gcc make git
-	WORKDIR="$(mktemp -d)"
-	trap 'rm -rf "${WORKDIR}"; error "Cleanup after failure"' ERR
-	git clone --depth 1 https://github.com/3proxy/3proxy.git "${WORKDIR}/3proxy"
-	make -C "${WORKDIR}/3proxy" -f Makefile.Linux
-	install -m 0755 "${WORKDIR}/3proxy/bin/3proxy" /usr/local/bin/3proxy
-	rm -rf "${WORKDIR}"
-	trap - ERR
-	# restore global trap removed above
-	trap 'error "An unexpected error occurred at line $LINENO."' ERR
-fi
+install_3proxy
 
 PROXY_BIN="$(command -v 3proxy || true)"
 if [ -z "${PROXY_BIN}" ]; then
@@ -265,25 +420,7 @@ log "3proxy log file: ${PROXY_LOG_FILE}"
 if [ "${SKIP_CLEAN}" -eq 1 ]; then
 	log "Skipping removal of existing global /128 IPv6 addresses on ${IFACE} (per --skip-clean)."
 else
-	mapfile -t TO_REMOVE < <(
-		ip -6 addr show dev "${IFACE}" scope global | awk '
-			/inet6/ {
-				split($2, a, "/")
-				if (a[2]=="128") print $2
-			}
-		'
-	)
-	if [ "${#TO_REMOVE[@]}" -eq 0 ]; then
-		log "No global IPv6 /128 addresses found to remove on ${IFACE}."
-	else
-		log "Removing existing global /128 IPv6 addresses on ${IFACE}..."
-		for CIDR in "${TO_REMOVE[@]}"; do
-			debug "Removing ${CIDR} from ${IFACE}..."
-			if ! ip -6 addr del "${CIDR}" dev "${IFACE}"; then
-				warn "Failed to remove ${CIDR} from ${IFACE}"
-			fi
-		done
-	fi
+	remove_ipv6_addresses "${IFACE}"
 fi
 
 log "Adding ${COUNT} IPv6 /128 addresses on ${IFACE}..."

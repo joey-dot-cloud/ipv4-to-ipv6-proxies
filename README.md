@@ -1,7 +1,7 @@
 # IPv4-to-IPv6 proxies with 3proxy
 
 This repository contains a Bash script (`script.sh`) that:
-- Generates a specified number of random IPv6 /128 addresses within your server’s on-link IPv6 subnet.
+- Generates a specified number of random IPv6 /128 addresses within your server's on-link IPv6 subnet.
 - Assigns those IPv6 addresses to a selected network interface.
 - Builds a 3proxy config that exposes multiple listeners on IPv4 (one port per IPv6) and egresses traffic via the corresponding IPv6 address.
 - Optionally installs and manages a systemd service for 3proxy.
@@ -20,9 +20,22 @@ Works on Debian/Ubuntu (or derivatives with `apt-get`). Root privileges are requ
 - Optional: `systemd` for service management.
 
 ## Quick start
+
+### Full Proxy Setup
 Interactive run (prompts for missing values):
 ```bash
 sudo bash script.sh
+```
+
+### Standalone Operations
+Install 3proxy only:
+```bash
+sudo bash script.sh --install
+```
+
+Uninstall 3proxy completely:
+```bash
+sudo bash script.sh --uninstall
 ```
 
 Non-interactive example (HTTP proxies):
@@ -59,7 +72,12 @@ You can pass options or let the script prompt you:
 
 - Legacy positional args are supported: `count user pass start_port iface`
 
-### Options
+### Standalone Options
+- **--install**: Install 3proxy only and exit (does not configure proxies).
+- **--uninstall**: Uninstall 3proxy and remove all related files, then exit.
+- **--remove-ipv6 [IFACE]**: Remove all global IPv6 /128 addresses from interface (auto-detects if not specified).
+
+### Proxy Configuration Options
 - **-c, --count N**: Number of IPv6 addresses to generate.
 - **-U, --user NAME**: 3proxy username.
 - **-P, --pass PASS**: 3proxy password.
@@ -76,6 +94,13 @@ You can pass options or let the script prompt you:
 - **-h, --help**: Show usage help.
 
 ### What the script does (in detail)
+
+#### Standalone Operations
+- **--install**: Downloads and compiles 3proxy from source, installs to `/usr/local/bin/3proxy`.
+- **--uninstall**: Stops and removes systemd service, kills running processes, removes binary and config files.
+- **--remove-ipv6**: Finds and removes all global IPv6 /128 addresses from the specified (or auto-detected) interface.
+
+#### Full Proxy Setup
 1. Ensures prerequisites (`iproute2`, and if needed, builds and installs 3proxy).
 2. Detects the target interface and on-link IPv6 subnet (or uses `-i`).
 3. Optionally removes existing global `/128` IPv6 addresses on that interface unless `--skip-clean` is set.
@@ -117,18 +142,14 @@ systemctl stop 3proxy
 - IPv6 space: If your prefix has very few host bits, the script enforces availability.
 - Re-runs: Existing addresses are removed unless `--skip-clean` is set. Config and unit files are backed up.
 - Security: Credentials are stored in the 3proxy config; control access to the server and config file.
+- Standalone operations: `--install`, `--uninstall`, and `--remove-ipv6` are mutually exclusive with proxy configuration.
 
 ### Troubleshooting
-- “This script must be run as root.” → Use `sudo`.
-- “apt-get not found.” → Use a Debian/Ubuntu system.
-- “Failed to detect an interface with a global IPv6 address.” → Ensure the server has a global IPv6 on some interface, or specify `-i`.
-- “Could not determine on-link IPv6 subnet…” → Ensure proper IPv6 routing/subnet configuration.
-- Service didn’t start: 
+- "This script must be run as root." → Use `sudo`.
+- "apt-get not found." → Use a Debian/Ubuntu system.
+- "Failed to detect an interface with a global IPv6 address." → Ensure the server has a global IPv6 on some interface, or specify `-i`.
+- "Could not determine on-link IPv6 subnet…" → Ensure proper IPv6 routing/subnet configuration.
+- Service didn't start: 
 ```bash
 journalctl -u 3proxy -xe --no-pager
-```
-
-## Example: 10 HTTP proxies on ports 30000–30009
-```bash
-sudo bash script.sh -c 10 -U bot -P p@ssw0rd -s 30000 -t http
 ```
